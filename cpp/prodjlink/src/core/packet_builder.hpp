@@ -101,6 +101,17 @@ public:
         pkt[0x26] = enable ? 0x10 : 0x20;
         return pkt;
     }
+
+    // 0x26 — MasterHandoff: ask targetDevice to become master
+    static std::vector<uint8_t> makeMasterHandoff(const std::string& name,
+                                                   uint8_t fromDevice,
+                                                   uint8_t targetDevice) {
+        constexpr uint16_t LEN = 0x28;
+        auto pkt = makeBasePacket(0x26, name, 0x01, LEN, fromDevice);
+        pkt[0x25] = targetDevice;
+        pkt[0x26] = fromDevice;
+        return pkt;
+    }
 };
 
 } // namespace prodjlink::detail

@@ -8,6 +8,8 @@ FetchContent_MakeAvailable(Catch2)
 
 add_executable(prodjlink_tests
     test_packet_parsing.cpp
+    test_dj_state.cpp
+    test_reconnect.cpp
 )
 
 target_link_libraries(prodjlink_tests

@@ -26,10 +26,14 @@ public:
 
     void onDeviceFound(DeviceCallback cb);
     void onDeviceLost(DeviceCallback cb);
+    // Called when a stale device sends a keep-alive again
+    void onDeviceRejoined(DeviceCallback cb);
 
     bool waitForDevices(std::chrono::milliseconds timeout);
 
-    static constexpr std::chrono::seconds DEVICE_TIMEOUT{10};
+    // Active→Stale after STALE_TIMEOUT, Stale→Lost after LOST_TIMEOUT
+    static constexpr std::chrono::seconds STALE_TIMEOUT{10};
+    static constexpr std::chrono::seconds LOST_TIMEOUT{30};
 
 private:
     struct Impl;

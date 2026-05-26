@@ -12,6 +12,14 @@
 
 namespace prodjlink {
 
+enum class DeviceState { Active, Stale, Lost };
+
+struct TrackedDevice {
+    DeviceAnnouncement da;
+    DeviceState state = DeviceState::Active;
+    std::chrono::steady_clock::time_point lastSeen;
+};
+
 struct DeviceFinder::Impl {
     std::optional<platform::UdpSocket> sock;
     std::atomic<bool> running{false};
@@ -19,21 +27,21 @@ struct DeviceFinder::Impl {
     std::thread dispatchThread;
 
     mutable std::mutex devMutex;
-    std::unordered_map<uint8_t, DeviceAnnouncement> devices;
-    std::unordered_map<uint8_t, std::chrono::steady_clock::time_point> lastSeen;
+    std::unordered_map<uint8_t, TrackedDevice> devices;
 
     std::mutex cbMutex;
     std::vector<DeviceCallback> foundCbs;
     std::vector<DeviceCallback> lostCbs;
+    std::vector<DeviceCallback> rejoinedCbs;
 
+    // Dispatch queue: enum tag + announcement
+    enum class DispatchTag { Found, Lost, Rejoined };
     std::mutex qMutex;
     std::condition_variable qCv;
-    // true = found, false = lost
-    std::queue<std::pair<bool, DeviceAnnouncement>> dispatchQ;
+    std::queue<std::pair<DispatchTag, DeviceAnnouncement>> dispatchQ;
 };
 
 DeviceFinder::DeviceFinder() : impl_(std::make_unique<Impl>()) {}
-
 DeviceFinder::~DeviceFinder() { stop(); }
 
 bool DeviceFinder::start() {
@@ -46,7 +54,7 @@ bool DeviceFinder::start() {
     if (!sock->bind(PORT_ANNOUNCEMENT, platform::UdpSocket::BindMode::Broadcast))
         return false;
 
-    impl_->sock = std::move(sock);
+    impl_->sock    = std::move(sock);
     impl_->running = true;
 
     impl_->dispatchThread = std::thread([this]() {
@@ -55,13 +63,15 @@ bool DeviceFinder::start() {
             impl_->qCv.wait_for(lk, std::chrono::milliseconds(100),
                                 [this]{ return !impl_->dispatchQ.empty(); });
             while (!impl_->dispatchQ.empty()) {
-                auto [found, da] = impl_->dispatchQ.front();
+                auto [tag, da] = impl_->dispatchQ.front();
                 impl_->dispatchQ.pop();
                 lk.unlock();
                 std::vector<DeviceCallback> cbs;
                 {
                     std::lock_guard<std::mutex> cbLk(impl_->cbMutex);
-                    cbs = found ? impl_->foundCbs : impl_->lostCbs;
+                    if      (tag == Impl::DispatchTag::Found)    cbs = impl_->foundCbs;
+                    else if (tag == Impl::DispatchTag::Lost)     cbs = impl_->lostCbs;
+                    else if (tag == Impl::DispatchTag::Rejoined) cbs = impl_->rejoinedCbs;
                 }
                 for (auto& cb : cbs) cb(da);
                 lk.lock();
@@ -73,36 +83,47 @@ bool DeviceFinder::start() {
         uint8_t buf[2048];
         std::array<uint8_t, 4> srcAddr{};
         uint16_t srcPort = 0;
+        auto now = std::chrono::steady_clock::now;
 
         while (impl_->running) {
             if (!impl_->sock) break;
+
             int n = impl_->sock->recvFrom(buf, sizeof(buf), srcAddr, srcPort);
-            if (n <= 0) {
-                // Timeout or error — check for expired devices
-                auto now = std::chrono::steady_clock::now();
-                std::vector<std::pair<uint8_t, DeviceAnnouncement>> expired;
+
+            // On every loop iteration (recv or timeout), check for stale/lost
+            {
+                auto t = now();
+                std::vector<std::pair<Impl::DispatchTag, DeviceAnnouncement>> events;
                 {
                     std::lock_guard<std::mutex> lk(impl_->devMutex);
-                    for (auto it = impl_->lastSeen.begin(); it != impl_->lastSeen.end(); ) {
-                        if (now - it->second > DEVICE_TIMEOUT) {
-                            auto devIt = impl_->devices.find(it->first);
-                            if (devIt != impl_->devices.end()) {
-                                expired.push_back({it->first, devIt->second});
-                                impl_->devices.erase(devIt);
-                            }
-                            it = impl_->lastSeen.erase(it);
-                        } else {
-                            ++it;
+                    for (auto& [num, td] : impl_->devices) {
+                        auto age = t - td.lastSeen;
+                        if (td.state == DeviceState::Active &&
+                            age > STALE_TIMEOUT) {
+                            td.state = DeviceState::Stale;
+                            // Stale = silent, no callback yet
+                        } else if (td.state == DeviceState::Stale &&
+                                   age > LOST_TIMEOUT) {
+                            td.state = DeviceState::Lost;
+                            events.push_back({Impl::DispatchTag::Lost, td.da});
                         }
                     }
+                    // Remove Lost devices from map
+                    for (auto it = impl_->devices.begin(); it != impl_->devices.end(); ) {
+                        if (it->second.state == DeviceState::Lost)
+                            it = impl_->devices.erase(it);
+                        else
+                            ++it;
+                    }
                 }
-                for (auto& [num, da] : expired) {
+                if (!events.empty()) {
                     std::lock_guard<std::mutex> qLk(impl_->qMutex);
-                    impl_->dispatchQ.push({false, da});
+                    for (auto& ev : events) impl_->dispatchQ.push(ev);
                     impl_->qCv.notify_one();
                 }
-                continue;
             }
+
+            if (n <= 0) continue;
 
             detail::PacketBuffer pkt(buf, static_cast<size_t>(n));
             if (!pkt.isValidHeader()) continue;
@@ -112,16 +133,26 @@ bool DeviceFinder::start() {
             if (!da) continue;
 
             uint8_t num = da->playerNumber();
-            bool isNew = false;
+            Impl::DispatchTag tag;
+            bool dispatch = false;
             {
                 std::lock_guard<std::mutex> lk(impl_->devMutex);
-                isNew = (impl_->devices.find(num) == impl_->devices.end());
-                impl_->devices[num] = *da;
-                impl_->lastSeen[num] = std::chrono::steady_clock::now();
+                auto it = impl_->devices.find(num);
+                if (it == impl_->devices.end()) {
+                    impl_->devices.emplace(num, TrackedDevice{*da, DeviceState::Active, now()});
+                    tag = Impl::DispatchTag::Found;
+                    dispatch = true;
+                } else {
+                    bool wasStale = (it->second.state == DeviceState::Stale);
+                    it->second.da       = *da;
+                    it->second.state    = DeviceState::Active;
+                    it->second.lastSeen = now();
+                    if (wasStale) { tag = Impl::DispatchTag::Rejoined; dispatch = true; }
+                }
             }
-            if (isNew) {
+            if (dispatch) {
                 std::lock_guard<std::mutex> qLk(impl_->qMutex);
-                impl_->dispatchQ.push({true, *da});
+                impl_->dispatchQ.push({tag, *da});
                 impl_->qCv.notify_one();
             }
         }
@@ -134,7 +165,7 @@ void DeviceFinder::stop() {
     if (!impl_->running) return;
     impl_->running = false;
     if (impl_->sock) impl_->sock->close();
-    if (impl_->recvThread.joinable())    impl_->recvThread.join();
+    if (impl_->recvThread.joinable()) impl_->recvThread.join();
     {
         std::lock_guard<std::mutex> lk(impl_->qMutex);
         impl_->qCv.notify_all();
@@ -147,16 +178,17 @@ bool DeviceFinder::isRunning() const noexcept { return impl_->running; }
 std::vector<DeviceAnnouncement> DeviceFinder::getDevices() const {
     std::lock_guard<std::mutex> lk(impl_->devMutex);
     std::vector<DeviceAnnouncement> result;
-    result.reserve(impl_->devices.size());
-    for (auto& [num, da] : impl_->devices) result.push_back(da);
+    for (auto& [num, td] : impl_->devices)
+        if (td.state != DeviceState::Lost) result.push_back(td.da);
     return result;
 }
 
 std::optional<DeviceAnnouncement> DeviceFinder::getDevice(uint8_t playerNumber) const {
     std::lock_guard<std::mutex> lk(impl_->devMutex);
     auto it = impl_->devices.find(playerNumber);
-    if (it == impl_->devices.end()) return std::nullopt;
-    return it->second;
+    if (it == impl_->devices.end() || it->second.state == DeviceState::Lost)
+        return std::nullopt;
+    return it->second.da;
 }
 
 void DeviceFinder::onDeviceFound(DeviceCallback cb) {
@@ -167,6 +199,11 @@ void DeviceFinder::onDeviceFound(DeviceCallback cb) {
 void DeviceFinder::onDeviceLost(DeviceCallback cb) {
     std::lock_guard<std::mutex> lk(impl_->cbMutex);
     impl_->lostCbs.push_back(std::move(cb));
+}
+
+void DeviceFinder::onDeviceRejoined(DeviceCallback cb) {
+    std::lock_guard<std::mutex> lk(impl_->cbMutex);
+    impl_->rejoinedCbs.push_back(std::move(cb));
 }
 
 bool DeviceFinder::waitForDevices(std::chrono::milliseconds timeout) {

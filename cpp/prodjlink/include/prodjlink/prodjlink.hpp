@@ -1,6 +1,8 @@
 #pragma once
 #include "version.hpp"
 #include "types.hpp"
+#include "dj_state.hpp"
+#include "idj_device.hpp"
 #include "device_announcement.hpp"
 #include "beat.hpp"
 #include "cdj_status.hpp"

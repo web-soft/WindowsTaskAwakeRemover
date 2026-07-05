@@ -63,6 +63,8 @@ endif()
 
 if(PRODJLINK_INSTALL)
     include(GNUInstallDirs)
+    include(CMakePackageConfigHelpers)
+
     install(TARGETS prodjlink EXPORT prodjlinkTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -72,6 +74,21 @@ if(PRODJLINK_INSTALL)
     install(EXPORT prodjlinkTargets
         FILE ProDJLinkTargets.cmake
         NAMESPACE prodjlink::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/prodjlink
+    )
+    configure_package_config_file(
+        cmake/ProDJLinkConfig.cmake.in
+        "${CMAKE_CURRENT_BINARY_DIR}/ProDJLinkConfig.cmake"
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/prodjlink
+    )
+    write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/ProDJLinkConfigVersion.cmake"
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/ProDJLinkConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/ProDJLinkConfigVersion.cmake"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/prodjlink
     )
 endif()
